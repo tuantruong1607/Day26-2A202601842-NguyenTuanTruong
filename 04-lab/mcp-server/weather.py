@@ -1,6 +1,6 @@
 from typing import Any
-import asyncio
 import httpx
+import logging
 import os
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
@@ -11,42 +11,50 @@ load_dotenv()
 # Initialize FastMCP server
 port = int(os.getenv("PORT", 8085))
 mcp = FastMCP("weather", host="0.0.0.0", port=port)
+logger = logging.getLogger(__name__)
+# httpx logs full query strings at INFO, which would expose WEATHERAPI_KEY.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Constants
 WEATHERAPI_BASE = "https://api.weatherapi.com/v1"
 USER_AGENT = "weather-app/1.0"
 
-# Get API key from environment variable
-API_KEY = os.getenv("WEATHERAPI_KEY")
-
 async def make_weather_request(endpoint: str, params: dict[str, str]) -> dict[str, Any] | None:
     """Make a request to the WeatherAPI with proper error handling."""
-    # Check if API key is set
-    if not API_KEY:
-        print("ERROR: WeatherAPI key not set. Please set WEATHERAPI_KEY environment variable.")
+    api_key = os.getenv("WEATHERAPI_KEY")
+    if not api_key:
+        logger.warning("WEATHERAPI_KEY is not set; using local demo weather data")
         return None
-        
+
     headers = {
         "User-Agent": USER_AGENT,
     }
-    # Add API key to parameters
-    params["key"] = API_KEY
-    
+    request_params = {**params, "key": api_key}
+
     url = f"{WEATHERAPI_BASE}/{endpoint}"
-    
+
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, headers=headers, params=params, timeout=30.0)
+            response = await client.get(
+                url,
+                headers=headers,
+                params=request_params,
+                timeout=30.0,
+            )
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            print(f"HTTP Error {e.response.status_code}: {e.response.text}")
+            logger.warning(
+                "WeatherAPI returned HTTP %s: %s",
+                e.response.status_code,
+                e.response.text,
+            )
             return None
         except httpx.RequestError as e:
-            print(f"Request Error: {e}")
+            logger.warning("WeatherAPI request failed (%s)", type(e).__name__)
             return None
-        except Exception as e:
-            print(f"Unexpected error: {e}")
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning("WeatherAPI returned an invalid response: %s", e)
             return None
 
 _MOCK_WEATHER = {
@@ -155,7 +163,7 @@ _MOCK_WEATHER = {
 }
 
 def get_mock_data(city: str) -> dict:
-    city_lower = city.lower()
+    city_lower = city.strip().casefold()
     if city_lower in _MOCK_WEATHER:
         return _MOCK_WEATHER[city_lower]
     return {
@@ -210,6 +218,12 @@ def get_mock_data(city: str) -> dict:
         }
     }
 
+
+def format_location(location: dict[str, Any]) -> str:
+    """Join non-empty location fields without duplicate separators."""
+    parts = (location.get("name"), location.get("region"), location.get("country"))
+    return ", ".join(str(part) for part in parts if part)
+
 @mcp.tool()
 async def get_current_weather(city: str) -> str:
     """Get current weather conditions for a city.
@@ -217,6 +231,10 @@ async def get_current_weather(city: str) -> str:
     Args:
         city: City name (e.g., "Hanoi", "Haiphong", "Danang", "Brisbane", "Sydney")
     """
+    city = city.strip()
+    if not city:
+        raise ValueError("city must not be empty")
+
     params = {
         "q": city,
         "aqi": "no"
@@ -225,14 +243,13 @@ async def get_current_weather(city: str) -> str:
     data = await make_weather_request("current.json", params)
 
     if not data:
-        print(f"⚠️ WeatherAPI request failed for {city}. Falling back to local mock data.")
+        logger.info("Using local demo weather data for %s", city)
         data = get_mock_data(city)
 
     current = data["current"]
     location = data["location"]
     
-    return f"""
-Current Weather for {location['name']}, {location['region']}, {location['country']}:
+    return f"""Current Weather for {format_location(location)}:
 
 Temperature: {current['temp_c']}°C ({current['temp_f']}°F)
 Feels like: {current['feelslike_c']}°C ({current['feelslike_f']}°F)
@@ -243,8 +260,7 @@ Pressure: {current['pressure_mb']} mb
 UV Index: {current['uv']}
 Visibility: {current['vis_km']} km
 
-Last updated: {current['last_updated']}
-"""
+Last updated: {current['last_updated']}"""
 
 @mcp.tool()
 async def get_forecast(city: str, days: int = 3) -> str:
@@ -254,9 +270,13 @@ async def get_forecast(city: str, days: int = 3) -> str:
         city: City name (e.g., "Hanoi", "Haiphong", "Danang", "Brisbane", "Sydney", "Melbourne")
         days: Number of days to forecast (1-3 for free tier, max 10 for paid)
     """
-    # Limit days to 3 for free tier
-    days = min(days, 3)
-    
+    city = city.strip()
+    if not city:
+        raise ValueError("city must not be empty")
+
+    # WeatherAPI's free tier supports 1-3 days.
+    days = max(1, min(days, 3))
+
     params = {
         "q": city,
         "days": str(days),
@@ -267,28 +287,26 @@ async def get_forecast(city: str, days: int = 3) -> str:
     data = await make_weather_request("forecast.json", params)
 
     if not data:
-        print(f"⚠️ WeatherAPI request failed for {city}. Falling back to local mock data.")
+        logger.info("Using local demo forecast data for %s", city)
         data = get_mock_data(city)
 
     location = data["location"]
-    forecast_days = data["forecast"]["forecastday"]
+    forecast_days = data["forecast"]["forecastday"][:days]
     
     forecasts = []
-    forecasts.append(f"Weather Forecast for {location['name']}, {location['region']}, {location['country']}:")
+    forecasts.append(f"Weather Forecast for {format_location(location)}:")
     
     for day in forecast_days:
         day_data = day["day"]
         date = day["date"]
         
-        forecast = f"""
-{date}:
+        forecast = f"""{date}:
 High: {day_data['maxtemp_c']}°C ({day_data['maxtemp_f']}°F)
 Low: {day_data['mintemp_c']}°C ({day_data['mintemp_f']}°F)
 Condition: {day_data['condition']['text']}
 Chance of Rain: {day_data['daily_chance_of_rain']}%
 Max Wind: {day_data['maxwind_kph']} km/h
-UV Index: {day_data['uv']}
-"""
+UV Index: {day_data['uv']}"""
         forecasts.append(forecast)
 
     return "\n---\n".join(forecasts)
@@ -296,20 +314,8 @@ UV Index: {day_data['uv']}
 @mcp.tool()
 async def health_check() -> str:
     """Health check endpoint for deployment verification."""
-    return "✅ Weather MCP Server is running! Ready to provide weather data for Australian cities and worldwide."
-
-print("✅ MCP server initialized with Streamable HTTP transport")
-print("🔧 Available tools: get_current_weather, get_forecast, health_check")
+    return "Weather MCP Server is running and ready to provide weather data."
 
 if __name__ == "__main__":
-    import sys
-    
-    is_cloud_run = bool(os.getenv("PORT"))
-    is_standalone = len(sys.argv) == 1 and sys.stdin.isatty()
-    
-    if is_cloud_run or is_standalone:
-        print(f"🚀 Starting MCP server on http://0.0.0.0:{port}/mcp")
-        mcp.run(transport="streamable-http")
-    else:
-        print("Starting FastMCP server in stdio mode for local client", file=sys.stderr)
-        mcp.run()
+    print(f"Starting Weather MCP server on http://0.0.0.0:{port}/mcp")
+    mcp.run(transport="streamable-http")

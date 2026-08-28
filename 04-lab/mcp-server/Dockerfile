@@ -13,8 +13,8 @@ RUN pip install --no-cache-dir -e .
 # Copy application code
 COPY weather.py ./
 
-# Expose port (Cloud Run will override this)
-EXPOSE 8080
+# Local default; Cloud Run supplies its own PORT value.
+EXPOSE 8085
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
